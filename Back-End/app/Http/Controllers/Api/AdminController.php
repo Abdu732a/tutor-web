@@ -1,0 +1,2691 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Jobs\SendAnnouncementJob;
+use App\Models\Announcement;
+use App\Models\AnnouncementTemplate;
+use App\Models\Attendance;
+use App\Models\Message;
+use App\Models\Student;
+use App\Models\Tutor;
+use App\Mail\TutorWelcomeEmail;
+use App\Mail\TutorRejectionEmail;
+use App\Models\Tutorial;
+use App\Models\Course;
+use App\Models\TutorialSession;
+use App\Models\TutorialAssignment;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Str;
+
+
+class AdminController extends Controller
+{
+    /**
+     * Get comprehensive admin dashboard data.
+     */
+public function dashboard(Request $request)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $stats = [
+            'total_users' => User::count(),
+            'total_students' => User::where('role', 'student')->count(),
+            'total_tutors' => User::where('role', 'tutor')->count(),
+            'pending_verifications' => User::where('role', 'tutor')
+                ->where('status', 'pending')
+                ->count(),
+            'pending_reports' => TutorialSession::where('status', 'completed')
+                ->whereDoesntHave('attendances')
+                ->count(),
+            'total_classes' => Tutorial::count(),
+            'active_classes' => Tutorial::where('is_published', true)->count(),
+            'recent_attendance_count' => Attendance::whereDate('created_at', today())->count(),
+            // Add email queue stats if in development
+            'email_queue_count' => app()->environment('local', 'development') 
+                ? \App\Models\EmailQueue::count() 
+                : null,
+        ];
+
+        $recentActivities = User::with(['student', 'tutor'])
+            ->orderBy('created_at', 'desc')
+            ->limit(10)
+            ->get()
+            ->map(function ($user) {
+                $action = 'Registered as ' . $user->role;
+
+                if ($user->role === 'tutor' && $user->status === 'pending') {
+                    $action .= ' (Pending Approval)';
+                }
+
+                return [
+                    'id' => $user->id,
+                    'user' => $user->name,
+                    'action' => $action,
+                    'time' => $user->created_at ? $user->created_at->diffForHumans() : 'Recently', // FIX HERE
+                    'type' => $user->role,
+                    'status' => $user->status,
+                ];
+            });
+
+        return response()->json([
+            'success' => true,
+            'stats' => $stats,
+            'recent_activities' => $recentActivities,
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Admin dashboard error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch dashboard data',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+    /**
+     * Create a new user.
+     */
+    public function createUser(Request $request)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $validated = $request->validate([
+                'name' => 'required|string|max:255',
+                'email' => 'required|email|unique:users',
+                'phone' => 'nullable|string|max:20',
+                'role' => 'required|in:student,tutor,admin',
+                'password' => 'required|string|min:8',
+                'notes' => 'nullable|string|max:1000',
+            ]);
+
+            $user = User::create([
+                'name' => $validated['name'],
+                'email' => $validated['email'],
+                'phone' => $validated['phone'] ?? null,
+                'role' => $validated['role'],
+                'password' => Hash::make($validated['password']),
+                'status' => 'active',
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'User created successfully',
+                'user' => $user,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Create user error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to create user',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Update user information.
+     */
+    public function updateUser(Request $request, $userId)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $user = User::findOrFail($userId);
+
+            $validated = $request->validate([
+                'name' => 'sometimes|string|max:255',
+                'email' => 'sometimes|email|unique:users,email,' . $user->id,
+                'phone' => 'nullable|string|max:20',
+                'role' => 'sometimes|in:student,tutor,admin',
+                'status' => 'sometimes|in:active,suspended,pending',
+                'notes' => 'nullable|string|max:1000',
+            ]);
+
+            $user->update($validated);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'User updated successfully',
+                'user' => $user,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Update user error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to update user',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Delete user (soft delete).
+     */
+    public function deleteUser(Request $request, $userId)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $user = User::findOrFail($userId);
+            $user->delete();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'User deleted successfully',
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Delete user error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to delete user',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Suspend a user.
+     */
+    public function suspendUser(Request $request, User $user)
+    {
+        try {
+            if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+                return response()->json(['success' => false, 'message' => 'Unauthorized access'], 403);
+            }
+
+            if ($user->id === $request->user()->id) {
+                return response()->json(['success' => false, 'message' => 'You cannot suspend your own account'], 400);
+            }
+
+            if (in_array($user->role, ['admin', 'super_admin']) && !$request->user()->isSuperAdmin()) {
+                return response()->json(['success' => false, 'message' => 'Only super admin can suspend other admins'], 403);
+            }
+
+            $user->update([
+                'status' => 'suspended',
+                'suspended_at' => now(),
+            ]);
+
+            $user->refresh();
+
+            Log::info('User suspended', [
+                'admin_id' => $request->user()->id,
+                'suspended_user_id' => $user->id,
+                'status' => $user->status,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'User suspended successfully',
+                'user' => [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'status' => $user->status,
+                    'role' => $user->role,
+                    'suspended_at' => $user->suspended_at,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Suspend user error: ' . $e->getMessage());
+
+            return response()->json(['success' => false, 'message' => 'Failed to suspend user', 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Activate a user.
+     */
+    public function activateUser(Request $request, User $user)
+    {
+        try {
+            if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+                return response()->json(['success' => false, 'message' => 'Unauthorized access'], 403);
+            }
+
+            $user->update([
+                'status' => 'active',
+                'suspended_at' => null,
+            ]);
+
+            $user->refresh();
+
+            Log::info('User activated', [
+                'admin_id' => $request->user()->id,
+                'activated_user_id' => $user->id,
+                'status' => $user->status,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'User activated successfully',
+                'user' => [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'status' => $user->status,
+                    'role' => $user->role,
+                    'suspended_at' => $user->suspended_at,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Activate user error: ' . $e->getMessage());
+
+            return response()->json(['success' => false, 'message' => 'Failed to activate user', 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Toggle user status between active and suspended.
+     */
+    public function toggleUserStatus(Request $request, User $user)
+    {
+        try {
+            if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+                return response()->json(['success' => false, 'message' => 'Unauthorized access'], 403);
+            }
+
+            $newStatus = $user->status === 'active' ? 'suspended' : 'active';
+            $user->update([
+                'status' => $newStatus,
+                'suspended_at' => $newStatus === 'suspended' ? now() : null,
+            ]);
+
+            $user->refresh();
+
+            $action = $newStatus === 'suspended' ? 'suspended' : 'activated';
+            Log::info('User status toggled', [
+                'admin_id' => $request->user()->id,
+                'user_id' => $user->id,
+                'action' => $action,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => "User {$action} successfully",
+                'user' => [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'status' => $user->status,
+                    'role' => $user->role,
+                    'suspended_at' => $user->suspended_at,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Toggle user status error: ' . $e->getMessage());
+
+            return response()->json(['success' => false, 'message' => 'Failed to toggle user status', 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Get all users with pagination and search.
+     */
+    public function users(Request $request)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $query = User::with(['student', 'tutor']);
+
+            if ($request->has('search')) {
+                $search = $request->search;
+                $query->where(function ($q) use ($search) {
+                    $q->where('name', 'like', "%{$search}%")
+                        ->orWhere('email', 'like', "%{$search}%");
+                });
+            }
+
+            if ($request->has('role') && $request->role !== 'all') {
+                $query->where('role', $request->role);
+            }
+
+            $users = $query->orderBy('created_at', 'desc')
+                ->paginate($request->get('per_page', 15));
+
+            Log::info('Admin users fetch - User statuses:', [
+                'users_count' => $users->count(),
+                'user_statuses' => $users->map(function ($user) {
+                    return [
+                        'id' => $user->id,
+                        'name' => $user->name,
+                        'status' => $user->status,
+                    ];
+                })->toArray(),
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'users' => $users->items(),
+                'pagination' => [
+                    'current_page' => $users->currentPage(),
+                    'total_pages' => $users->lastPage(),
+                    'total_items' => $users->total(),
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Admin users error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch users',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Create an announcement.
+     */
+    public function createAnnouncement(Request $request)
+    {
+        try {
+            $admin = $request->user();
+
+            $validator = Validator::make($request->all(), [
+                'title' => 'required|string|max:255',
+                'message' => 'required|string|max:2000',
+                'priority' => 'required|in:low,normal,high,urgent',
+                'target_type' => 'required|in:all,roles,specific,filtered',
+                'target_roles' => 'nullable|array',
+                'target_users' => 'nullable|array',
+                'target_users.*' => 'exists:users,id',
+                'target_filters' => 'nullable|array',
+                'send_at' => 'nullable|date|after:now',
+                'template_id' => 'nullable|exists:announcement_templates,id',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed',
+                    'errors' => $validator->errors(),
+                ], 422);
+            }
+
+            $estimatedRecipients = $this->calculateRecipientCount($request->all());
+
+            $announcement = Announcement::create([
+                'admin_id' => $admin->id,
+                'title' => $request->title,
+                'message' => $request->message,
+                'priority' => $request->priority,
+                'target_type' => $request->target_type,
+                'target_roles' => $request->target_roles,
+                'target_users' => $request->target_users,
+                'target_filters' => $request->target_filters,
+                'send_at' => $request->send_at,
+                'estimated_recipients' => $estimatedRecipients,
+            ]);
+
+            if ($request->template_id) {
+                $template = AnnouncementTemplate::find($request->template_id);
+                $template->recordUsage($admin->id);
+            }
+
+            if (!$request->send_at) {
+                SendAnnouncementJob::dispatch($announcement);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => $request->send_at ? 'Announcement scheduled' : 'Announcement sent',
+                'data' => $announcement->load('admin'),
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Create announcement error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to create announcement',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Calculate how many users will receive this announcement.
+     */
+    public function calculateRecipientCount($data)
+    {
+        $query = User::query();
+
+        switch ($data['target_type']) {
+            case 'all':
+                $query->where('status', 'active');
+                break;
+
+            case 'roles':
+                $roles = $data['target_roles'] ?? [];
+                $query->whereIn('role', $roles)->where('status', 'active');
+                break;
+
+            case 'specific':
+                $userIds = $data['target_users'] ?? [];
+                $query->whereIn('id', $userIds);
+                break;
+
+            case 'filtered':
+                $filters = $data['target_filters'] ?? [];
+                $query = $this->applyFilters($query, $filters);
+                break;
+        }
+
+        return $query->count();
+    }
+
+    /**
+     * Get user count by filters (for real-time counting).
+     */
+    public function getUserCountByFilters(Request $request)
+    {
+        try {
+            $data = $request->validate([
+                'target_type' => 'required|in:all,roles,specific,filtered',
+                'target_roles' => 'nullable|array',
+                'target_users' => 'nullable|array',
+                'target_users.*' => 'exists:users,id',
+                'target_filters' => 'nullable|array',
+            ]);
+
+            $count = $this->calculateRecipientCount($data);
+
+            return response()->json([
+                'success' => true,
+                'count' => $count,
+                'data' => $data,
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to calculate user count',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Get all announcement templates.
+     */
+    public function getTemplates(Request $request)
+    {
+        try {
+            $templates = AnnouncementTemplate::orderBy('usage_count', 'desc')
+                ->orderBy('name')
+                ->get();
+
+            return response()->json([
+                'success' => true,
+                'data' => $templates,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Get templates error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch templates',
+            ], 500);
+        }
+    }
+
+    /**
+     * Create a new announcement template.
+     */
+    public function createTemplate(Request $request)
+    {
+        try {
+            $admin = $request->user();
+
+            $validator = Validator::make($request->all(), [
+                'name' => 'required|string|max:255|unique:announcement_templates,name',
+                'title' => 'required|string|max:255',
+                'message' => 'required|string|max:2000',
+                'suggested_target_type' => 'nullable|in:all,roles,specific,filtered',
+                'suggested_priority' => 'nullable|in:low,normal,high,urgent',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed',
+                    'errors' => $validator->errors(),
+                ], 422);
+            }
+
+            $template = AnnouncementTemplate::create([
+                'name' => $request->name,
+                'title' => $request->title,
+                'message' => $request->message,
+                'suggested_target_type' => $request->suggested_target_type ?? 'all',
+                'suggested_priority' => $request->suggested_priority ?? 'normal',
+                'created_by' => $admin->id,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Template created successfully',
+                'data' => $template,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Create template error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to create template',
+            ], 500);
+        }
+    }
+
+    /**
+     * Get announcement history.
+     */
+    public function getAnnouncements(Request $request)
+    {
+        try {
+            $announcements = Announcement::with('admin')
+                ->orderBy('created_at', 'desc')
+                ->paginate(20);
+
+            return response()->json([
+                'success' => true,
+                'data' => $announcements,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Get announcements error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch announcements',
+            ], 500);
+        }
+    }
+
+    /**
+     * Apply filters to user query.
+     */
+    private function applyFilters($query, $filters)
+    {
+        foreach ($filters as $key => $value) {
+            if (empty($value)) {
+                continue;
+            }
+
+            switch ($key) {
+                case 'status':
+                    $query->where('status', $value);
+                    break;
+
+                case 'roles':
+                    $query->whereIn('role', (array)$value);
+                    break;
+
+                case 'join_date_after':
+                    $query->where('created_at', '>=', $value);
+                    break;
+
+                case 'join_date_before':
+                    $query->where('created_at', '<=', $value);
+                    break;
+
+                case 'last_active_after':
+                    $query->where('last_login_at', '>=', $value);
+                    break;
+
+                case 'has_classes':
+                    if ($value === 'yes') {
+                        $query->where('classes', '>', 0);
+                    } elseif ($value === 'no') {
+                        $query->where('classes', 0);
+                    }
+                    break;
+            }
+        }
+
+        return $query;
+    }
+
+    /**
+     * Get pending tutor applications.
+     */
+    public function pendingTutors(Request $request)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $pendingTutors = User::with(['tutor', 'tutor.subjects'])
+                ->where('role', 'tutor')
+                ->where('status', 'pending')
+                ->orderBy('created_at', 'desc')
+                ->get()
+                ->map(function ($user) {
+                    $tutor = $user->tutor;
+
+                    return [
+                        'id' => $tutor->id,
+                        'user_id' => $user->id,
+                        'name' => $user->name,
+                        'email' => $user->email,
+                        'qualification' => $tutor->qualification,
+                        'experience_years' => $tutor->experience_years,
+                        'subjects' => $tutor->subjects->pluck('subject_name')->toArray(),
+                        'submitted_at' => $user->created_at->toISOString(),
+                        'status' => $user->status,
+                        'phone' => $user->phone,
+                        'age' => $tutor->age,
+                        'country' => $tutor->country,
+                        'city' => $tutor->city,
+                        'bio' => $tutor->bio,
+                        'hourly_rate' => $tutor->hourly_rate,
+                        'address' => $tutor->address,
+                        'degree_photo' => $tutor->degree_photo,
+                        'degree_photo_url' => $tutor->degree_photo ? url('storage/' . $tutor->degree_photo) : null,
+                        'degree_verified' => $tutor->degree_verified,
+                        'rejection_reason' => $tutor->rejection_reason,
+                    ];
+                });
+
+            return response()->json([
+                'success' => true,
+                'tutors' => $pendingTutors,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Admin pending tutors error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch pending tutors',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Approve tutor application.
+     */
+    public function approveTutor(Request $request, $tutorId)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        DB::beginTransaction();
+
+        try {
+            // Try to find tutor by ID first
+            $tutor = Tutor::find($tutorId);
+            
+            // If not found, try to find by user_id (in case frontend passed user ID)
+            if (!$tutor) {
+                $tutor = Tutor::where('user_id', $tutorId)->first();
+            }
+            
+            // If still not found, throw error
+            if (!$tutor) {
+                throw new \Exception("Tutor not found with ID: {$tutorId}. Please check if the tutor exists and try again.");
+            }
+
+            $user = $tutor->user;
+
+            if (!$user) {
+                throw new \Exception('User not found for this tutor');
+            }
+
+            $user->status = 'active';
+            // ✅ FIX: Verify email when admin approves tutor
+            $user->email_verified_at = now();
+            $user->email_verification_token = null;
+            $user->save();
+
+            $tutor->is_verified = true;
+            $tutor->save();
+
+            try {
+                Mail::to($user->email)->send(new TutorWelcomeEmail($user, $tutor));
+    
+                Log::info('Tutor welcome email sent', [
+                    'admin_id' => $request->user()->id,
+                    'tutor_id' => $tutor->id,
+                    'tutor_email' => $user->email,
+                ]);
+            } catch (\Exception $e) {
+                Log::error('Failed to send tutor welcome email: ' . $e->getMessage());
+                // Don't fail approval if email fails
+            }
+
+            Log::info('Tutor approved by admin', [
+                'admin_id' => $request->user()->id,
+                'admin_name' => $request->user()->name,
+                'tutor_id' => $tutor->id,
+                'tutor_name' => $user->name,
+                'approved_at' => now(),
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Tutor approved successfully. Notification email sent.',
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            Log::error('Approve tutor error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to approve tutor',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+ * Send tutor approval/rejection email.
+ */
+private function sendTutorApprovalEmail($user, $isApproved = true, $reason = null)
+{
+    try {
+        $tutor = $user->tutor;
+        
+        if ($isApproved && $tutor) {
+            // Send welcome email
+            Mail::to($user->email)->send(new TutorWelcomeEmail($user, $tutor));
+            
+            Log::info('Tutor welcome email sent', [
+                'tutor_id' => $user->id,
+                'tutor_email' => $user->email,
+                'status' => 'approved',
+            ]);
+        } else {
+            // Send rejection email
+            Mail::to($user->email)->send(new TutorRejectionEmail($user, $reason));
+            
+            Log::info('Tutor rejection email sent', [
+                'tutor_id' => $user->id,
+                'tutor_email' => $user->email,
+                'status' => 'suspended',
+                'reason' => $reason,
+            ]);
+        }
+    } catch (\Exception $e) {
+        Log::error('Failed to send tutor status email: ' . $e->getMessage());
+    }
+}
+    /**
+     * Reject tutor application.
+     */
+    public function rejectTutor(Request $request, $tutorId)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'rejection_reason' => 'required|string|min:10|max:500',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        DB::beginTransaction();
+
+        try {
+            // Try to find tutor by ID first
+            $tutor = Tutor::find($tutorId);
+            
+            // If not found, try to find by user_id (in case frontend passed user ID)
+            if (!$tutor) {
+                $tutor = Tutor::where('user_id', $tutorId)->first();
+            }
+            
+            // If still not found, throw error
+            if (!$tutor) {
+                throw new \Exception("Tutor not found with ID: {$tutorId}. Please check if the tutor exists and try again.");
+            }
+
+            $user = $tutor->user;
+
+            if (!$user) {
+                throw new \Exception('User not found for this tutor');
+            }
+
+            $user->status = 'suspended';
+            $user->save();
+
+            $tutor->rejection_reason = $request->rejection_reason;
+            $tutor->save();
+
+            $this->sendTutorApprovalEmail($user, false, $request->rejection_reason);
+
+            Log::info('Tutor rejected by admin', [
+                'admin_id' => $request->user()->id,
+                'admin_name' => $request->user()->name,
+                'tutor_id' => $tutor->id,
+                'tutor_name' => $user->name,
+                'rejection_reason' => $request->rejection_reason,
+                'rejected_at' => now(),
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Tutor application rejected. Notification email sent.',
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            Log::error('Reject tutor error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to reject tutor',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+public function getPendingTutorials(Request $request)
+{
+    try {
+        $tutorials = Tutorial::with(['tutor', 'course', 'category'])
+            ->where('status', 'pending_approval')
+            ->orderBy('created_at', 'desc')
+            ->get()
+            ->map(function($tutorial) {
+                return [
+                    'id' => $tutorial->id,
+                    'title' => $tutorial->title,
+                    'description' => $tutorial->description,
+                    'tutor_id' => $tutorial->tutor_id,
+                    'tutor_name' => $tutorial->tutor->name ?? 'Unknown Tutor',
+                    'course_id' => $tutorial->course_id,
+                    'course_title' => $tutorial->course->title ?? 'Unknown Course',
+                    'category' => $tutorial->category ? [
+                        'id' => $tutorial->category->id,
+                        'name' => $tutorial->category->name
+                    ] : null,
+                    'price' => $tutorial->price,
+                    'level' => $tutorial->level,
+                    'status' => $tutorial->status,
+                    'created_at' => $tutorial->created_at,
+                    'updated_at' => $tutorial->updated_at,
+                    'batch_name' => $tutorial->batch_name,
+                    'schedule' => $tutorial->schedule,
+                    'start_date' => $tutorial->start_date,
+                    'learning_outcomes' => $tutorial->learning_outcomes ? json_decode($tutorial->learning_outcomes, true) : [],
+                    'requirements' => $tutorial->requirements ? json_decode($tutorial->requirements, true) : [],
+                ];
+            });
+
+        return response()->json([
+            'success' => true,
+            'tutorials' => $tutorials,
+            'count' => $tutorials->count()
+        ]);
+
+    } catch (\Exception $e) {
+        Log::error('Get pending tutorials error: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch pending tutorials',
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}
+
+public function approveTutorial(Request $request, $id)
+{
+    try {
+        $user = Auth::user();
+        
+        if ($user->role !== 'admin') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Admin access required.'
+            ], 403);
+        }
+
+        $tutorial = Tutorial::findOrFail($id);
+        
+        if ($tutorial->status !== 'pending_approval') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tutorial is not pending approval'
+            ], 422);
+        }
+
+        // Update tutorial status
+        $tutorial->update([
+            'status' => 'approved',
+            'approved_by_admin_id' => $user->id,
+            'approved_at' => now(),
+            'rejection_reason' => null
+        ]);
+
+        // Send notification to tutor
+        $this->sendTutorialApprovedNotification($tutorial);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Tutorial approved successfully',
+            'tutorial' => $tutorial
+        ]);
+
+    } catch (\Exception $e) {
+        Log::error('Approve tutorial error: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to approve tutorial',
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}
+
+public function rejectTutorial(Request $request, $id)
+{
+    try {
+        $user = Auth::user();
+        
+        if ($user->role !== 'admin') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Admin access required.'
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'reason' => 'required|string|min:10|max:500'
+        ]);
+
+        $tutorial = Tutorial::findOrFail($id);
+        
+        if ($tutorial->status !== 'pending_approval') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tutorial is not pending approval'
+            ], 422);
+        }
+
+        // Update tutorial status
+        $tutorial->update([
+            'status' => 'rejected',
+            'rejection_reason' => $validated['reason'],
+            'approved_by_admin_id' => null,
+            'approved_at' => null
+        ]);
+
+        // Send notification to tutor
+        $this->sendTutorialRejectedNotification($tutorial, $validated['reason']);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Tutorial rejected',
+            'tutorial' => $tutorial
+        ]);
+
+    } catch (\Exception $e) {
+        Log::error('Reject tutorial error: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to reject tutorial',
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}
+
+/**
+ * Get tutorials pending publication (requested by tutors)
+ */
+public function getPendingPublicationTutorials(Request $request)
+{
+    try {
+        $user = Auth::user();
+        
+        if ($user->role !== 'admin') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Admin access required.'
+            ], 403);
+        }
+
+        $tutorials = Tutorial::with(['tutor', 'course', 'category'])
+            ->where('status', 'pending_publication')
+            ->orderBy('publication_requested_at', 'desc')
+            ->get()
+            ->map(function($tutorial) {
+                $lessonsCount = $tutorial->lessons()->count();
+                return [
+                    'id' => $tutorial->id,
+                    'title' => $tutorial->title,
+                    'description' => $tutorial->description,
+                    'tutor_id' => $tutorial->tutor_id,
+                    'tutor_name' => $tutorial->tutor->name ?? 'Unknown Tutor',
+                    'course_id' => $tutorial->course_id,
+                    'course_title' => $tutorial->course->title ?? 'Unknown Course',
+                    'category' => $tutorial->category ? [
+                        'id' => $tutorial->category->id,
+                        'name' => $tutorial->category->name
+                    ] : null,
+                    'price' => $tutorial->price,
+                    'level' => $tutorial->level,
+                    'status' => $tutorial->status,
+                    'lessons_count' => $lessonsCount,
+                    'publication_requested_at' => $tutorial->publication_requested_at,
+                    'created_at' => $tutorial->created_at,
+                    'updated_at' => $tutorial->updated_at,
+                ];
+            });
+
+        return response()->json([
+            'success' => true,
+            'tutorials' => $tutorials,
+            'count' => $tutorials->count()
+        ]);
+
+    } catch (\Exception $e) {
+        Log::error('Get pending publication tutorials error: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch tutorials pending publication',
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}
+
+public function publishTutorial(Request $request, $id)
+{
+    try {
+        $user = Auth::user();
+        
+        if ($user->role !== 'admin') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Admin access required.'
+            ], 403);
+        }
+
+        $tutorial = Tutorial::findOrFail($id);
+        
+        // Allow publishing from both approved and pending_publication statuses
+        if (!in_array($tutorial->status, ['approved', 'pending_publication'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only approved tutorials or tutorials pending publication can be published'
+            ], 422);
+        }
+
+        // Check if tutorial has lessons
+        $lessonsCount = $tutorial->lessons()->count();
+        if ($lessonsCount === 0) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tutorial must have at least one lesson before publishing'
+            ], 400);
+        }
+
+        // Update tutorial status
+        $tutorial->update([
+            'status' => 'published',
+            'is_published' => true
+        ]);
+
+        // Send notification to tutor
+        $this->sendTutorialPublishedNotification($tutorial);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Tutorial published successfully',
+            'tutorial' => $tutorial
+        ]);
+
+    } catch (\Exception $e) {
+        Log::error('Publish tutorial error: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to publish tutorial',
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}
+
+private function sendTutorialApprovedNotification($tutorial)
+{
+    try {
+        $tutor = User::find($tutorial->tutor_id);
+        if ($tutor) {
+            DB::table('messages')->insert([
+                'sender_id' => Auth::id(),
+                'receiver_id' => $tutor->id,
+                'message' => "✅ Your tutorial '{$tutorial->title}' has been approved by admin. It is now ready for publishing.",
+                'created_at' => now(),
+                'updated_at' => now()
+            ]);
+        }
+    } catch (\Exception $e) {
+        Log::error('Send approval notification error: ' . $e->getMessage());
+    }
+}
+
+private function sendTutorialRejectedNotification($tutorial, $reason)
+{
+    try {
+        $tutor = User::find($tutorial->tutor_id);
+        if ($tutor) {
+            DB::table('messages')->insert([
+                'sender_id' => Auth::id(),
+                'receiver_id' => $tutor->id,
+                'message' => "❌ Your tutorial '{$tutorial->title}' was rejected. Reason: {$reason}\n\nYou can update and resubmit.",
+                'created_at' => now(),
+                'updated_at' => now()
+            ]);
+        }
+    } catch (\Exception $e) {
+        Log::error('Send rejection notification error: ' . $e->getMessage());
+    }
+}
+
+private function sendTutorialPublishedNotification($tutorial)
+{
+    try {
+        $tutor = User::find($tutorial->tutor_id);
+        if ($tutor) {
+            DB::table('messages')->insert([
+                'sender_id' => Auth::id(),
+                'receiver_id' => $tutor->id,
+                'message' => "🎉 Your tutorial '{$tutorial->title}' has been published! Students can now enroll and access your content.",
+                'created_at' => now(),
+                'updated_at' => now()
+            ]);
+        }
+    } catch (\Exception $e) {
+        Log::error('Send published notification error: ' . $e->getMessage());
+    }
+}
+
+    /**
+     * Get pending session reports.
+     */
+    public function pendingReports(Request $request)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $pendingReports = TutorialSession::with([
+                'tutorial.enrollments',
+                'attendances',
+            ])
+                ->with(['tutor' => function ($query) {
+                    $query->select('id', 'name');
+                }])
+                ->where('status', 'completed')
+                ->orderBy('created_at', 'desc')
+                ->get()
+                ->map(function ($session) {
+                    $tutorName = $session->tutor ? $session->tutor->name : 'Unknown Tutor';
+                    $totalStudents = $session->tutorial ? $session->tutorial->enrollments->count() : 0;
+                    $studentsPresent = $session->attendances->where('status', 'present')->count();
+
+                    return [
+                        'id' => $session->id,
+                        'session_id' => $session->id,
+                        'tutor_name' => $tutorName,
+                        'session_title' => $session->title,
+                        'session_date' => $session->start_time->toISOString(),
+                        'students_present' => $studentsPresent,
+                        'total_students' => $totalStudents,
+                        'submitted_at' => $session->updated_at->toISOString(),
+                    ];
+                });
+
+            return response()->json([
+                'success' => true,
+                'reports' => $pendingReports,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Admin pending reports error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch pending reports',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Get attendance records with filters.
+     */
+    public function attendance(Request $request)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $query = Attendance::with(['user', 'tutorial', 'tutorialSession']);
+
+            if ($request->has('tutorial_id')) {
+                $query->where('tutorial_id', $request->tutorial_id);
+            }
+
+            if ($request->has('user_id')) {
+                $query->where('user_id', $request->user_id);
+            }
+
+            if ($request->has('status')) {
+                $query->where('status', $request->status);
+            }
+
+            if ($request->has('start_date') && $request->has('end_date')) {
+                $query->whereBetween('session_date', [
+                    $request->start_date,
+                    $request->end_date,
+                ]);
+            }
+
+            $attendance = $query->orderBy('session_date', 'desc')
+                ->paginate($request->get('per_page', 15));
+
+            return response()->json([
+                'success' => true,
+                'attendance' => $attendance->items(),
+                'pagination' => [
+                    'current_page' => $attendance->currentPage(),
+                    'total_pages' => $attendance->lastPage(),
+                    'total_items' => $attendance->total(),
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Admin attendance error: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch attendance records',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function classes(Request $request)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $query = Tutorial::with([
+            'tutor' => function($q) {
+                $q->select('id', 'name', 'email', 'role');
+            },
+            'category' => function($q) {
+                $q->select('id', 'name', 'color');
+            },
+            'course' => function($q) { // NEW: Include course
+                $q->select('id', 'title', 'category', 'duration_hours');
+            },
+            'enrollments'
+        ]);
+
+        if ($request->has('search')) {
+            $search = $request->search;
+            $query->where(function ($q) use ($search) {
+                $q->where('title', 'like', "%{$search}%")
+                  ->orWhere('batch_name', 'like', "%{$search}%") // NEW: Search batch name
+                  ->orWhere('enrollment_code', 'like', "%{$search}%"); // NEW: Search enrollment code
+            });
+        }
+        
+        // NEW: Filter by course_id
+        if ($request->has('course_id')) {
+            $query->where('course_id', $request->course_id);
+        }
+        
+        // NEW: Filter by status
+        if ($request->has('status')) {
+            $query->where('status', $request->status);
+        }
+
+        $perPage = $request->get('per_page', 12);
+        $classes = $query->paginate($perPage);
+
+        return response()->json([
+            'success' => true,
+            'classes' => $classes->items(),
+            'pagination' => [
+                'current_page' => $classes->currentPage(),
+                'total_pages' => $classes->lastPage(),
+                'total_items' => $classes->total(),
+                'per_page' => $classes->perPage(),
+            ]
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Fetch classes error: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch classes',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+   /**
+ * Create a new class/tutorial (Admin creates and assigns)
+ */
+public function createClass(Request $request)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    $validator = Validator::make($request->all(), [
+        'title' => 'required|string|max:255',
+        'description' => 'required|string',
+        'tutor_id' => 'required|exists:users,id',
+        'category_id' => 'required|exists:categories,id',
+        'course_id' => 'required|exists:courses,id', // NEW: Require course
+        'batch_name' => 'nullable|string|max:100', // NEW: Batch name
+        'duration' => 'required|string|max:50',
+        'level' => 'required|in:Beginner,Intermediate,Advanced',
+        'price' => 'required|numeric|min:0',
+        'max_capacity' => 'required|integer|min:1|max:100', // NEW: Max capacity
+        'schedule' => 'nullable|string', // NEW: Schedule
+        'start_date' => 'required|date', // NEW: Start date
+        'end_date' => 'required|date|after_or_equal:start_date', // NEW: End date
+        'learning_objectives' => 'nullable|array',
+        'includes' => 'nullable|array',
+        'image' => 'nullable|string|url',
+    ]);
+
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Validation failed',
+            'errors' => $validator->errors(),
+        ], 422);
+    }
+
+    DB::beginTransaction();
+    try {
+        $tutor = User::findOrFail($request->tutor_id);
+
+        if ($tutor->role !== 'tutor') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Selected user is not a tutor',
+            ], 422);
+        }
+
+        // Get course to auto-fill some fields if needed
+        $course = Course::find($request->course_id);
+        
+        // Generate enrollment code if not provided
+        $enrollmentCode = $request->enrollment_code ?? $this->generateEnrollmentCode();
+
+        // Create tutorial with admin as creator
+        $class = Tutorial::create([
+            'admin_id' => $request->user()->id,
+            'created_by_role' => 'admin',
+            'tutor_id' => $tutor->id,
+            'course_id' => $request->course_id, // NEW: Link to course
+            'title' => $request->title,
+            'batch_name' => $request->batch_name, // NEW: Batch name
+            'enrollment_code' => $enrollmentCode, // NEW: Enrollment code
+            'description' => $request->description,
+            'category_id' => $request->category_id,
+            'duration' => $request->duration,
+            'level' => $request->level,
+            'price' => $request->price,
+            'max_capacity' => $request->max_capacity, // NEW: Max capacity
+            'current_enrollment' => 0, // Start with 0 enrollment
+            'schedule' => $request->schedule, // NEW: Schedule
+            'start_date' => $request->start_date, // NEW: Start date
+            'end_date' => $request->end_date, // NEW: End date
+            'instructor' => $tutor->name,
+            'learning_objectives' => $request->learning_objectives,
+            'includes' => $request->includes,
+            'image' => $request->image ?? 'https://images.unsplash.com/photo-1516035069371-29a1b244cc32?w=400',
+            'is_published' => false,
+            'status' => 'draft',
+        ]);
+
+        // Create assignment record
+        $assignment = TutorialAssignment::create([
+            'tutorial_id' => $class->id,
+            'tutor_id' => $tutor->id,
+            'assigned_by_admin_id' => $request->user()->id,
+            'status' => 'pending',
+        ]);
+
+        DB::commit();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Class created and assigned to tutor successfully',
+            'class' => $class->load(['tutor', 'category', 'course', 'assignments']), // NEW: Include course
+            'assignment' => $assignment
+        ]);
+    } catch (\Exception $e) {
+        DB::rollBack();
+        Log::error('Create class error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to create class',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+// Add this helper method to generate enrollment code
+private function generateEnrollmentCode()
+{
+    do {
+        $code = 'CLASS-' . strtoupper(\Illuminate\Support\Str::random(6));
+    } while (Tutorial::where('enrollment_code', $code)->exists());
+    
+    return $code;
+}
+
+/**
+ * Update a class/tutorial.
+ */
+public function updateClass(Request $request, $id)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    $validator = Validator::make($request->all(), [
+        'title' => 'sometimes|string|max:255',
+        'description' => 'sometimes|string',
+        'tutor_id' => 'sometimes|exists:users,id',
+        'category_id' => 'sometimes|exists:categories,id',
+        'duration' => 'sometimes|string|max:50',
+        'level' => 'sometimes|in:Beginner,Intermediate,Advanced',
+        'price' => 'sometimes|numeric|min:0',
+        'learning_objectives' => 'nullable|array',
+        'includes' => 'nullable|array',
+        'is_published' => 'sometimes|boolean',
+    ]);
+
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Validation failed',
+            'errors' => $validator->errors(),
+        ], 422);
+    }
+
+    try {
+        $class = Tutorial::findOrFail($id);
+        
+        $updateData = $request->only([
+            'title', 'description', 'category_id', 'duration', 
+            'level', 'price', 'learning_objectives', 'includes', 'is_published'
+        ]);
+        
+        if ($request->has('tutor_id')) {
+            $tutor = User::findOrFail($request->tutor_id);
+            if ($tutor->role !== 'tutor') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Selected user is not a tutor',
+                ], 422);
+            }
+            $updateData['tutor_id'] = $tutor->id;
+            $updateData['instructor'] = $tutor->name;
+        }
+        
+        $class->update($updateData);
+        
+        return response()->json([
+            'success' => true,
+            'message' => 'Class updated successfully',
+            'class' => $class->load(['tutor', 'category']),
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Update class error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to update class',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+/**
+ * Delete/Archive a class.
+ */
+public function deleteClass(Request $request, $id)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $class = Tutorial::findOrFail($id);
+        
+        // Instead of deleting, we can archive it
+        $class->update(['is_published' => false]);
+        
+        return response()->json([
+            'success' => true,
+            'message' => 'Class archived successfully',
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Delete class error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to archive class',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+public function getTutorials(Request $request)
+{
+    $query = Tutorial::with(['tutor', 'category'])
+        ->when($request->course_id, function($q) use ($request) {
+            $q->where('course_id', $request->course_id);
+        })
+        ->orderBy('created_at', 'desc');
+
+    $tutorials = $query->get()->map(function($t) {
+        return [
+            'id' => $t->id,
+            'title' => $t->title,
+            'description' => $t->description,
+            'status' => $t->status,
+            'batch_name' => $t->batch_name,
+            'level' => $t->level,
+            'duration_hours' => $t->duration_hours,
+            'created_at' => $t->created_at,
+            'approved_at' => $t->approved_at,
+            'tutor_name' => $t->tutor?->name,
+        ];
+    });
+
+    return response()->json([
+        'success' => true,
+        'tutorials' => $tutorials
+    ]);
+}
+
+/**
+ * Get class details with enrolled students.
+ */
+public function getClassDetails(Request $request, $id)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $class = Tutorial::with([
+            'tutor',
+            'category',
+            'enrollments.user.student',
+            'tutorialSessions',
+            'lessons'
+        ])->findOrFail($id);
+        
+        $activeStudents = $class->enrollments()
+            ->where('status', 'active')
+            ->with('user')
+            ->get()
+            ->map(function ($enrollment) {
+                return [
+                    'id' => $enrollment->user->id,
+                    'name' => $enrollment->user->name,
+                    'email' => $enrollment->user->email,
+                    'enrolled_at' => $enrollment->created_at->toISOString(),
+                    'status' => $enrollment->status,
+                ];
+            });
+        
+        return response()->json([
+            'success' => true,
+            'class' => $class,
+            'students' => $activeStudents,
+            'total_students' => $activeStudents->count(),
+            'sessions_count' => $class->tutorialSessions->count(),
+            'lessons_count' => $class->lessons->count(),
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Get class details error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch class details',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}   
+
+/**
+ * Get students enrolled in a class.
+ */
+public function getClassStudents(Request $request, $id)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $class = Tutorial::findOrFail($id);
+        
+        $query = $class->enrollments()->with('user');
+        
+        if ($request->has('search')) {
+            $search = $request->search;
+            $query->whereHas('user', function ($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('email', 'like', "%{$search}%");
+            });
+        }
+        
+        if ($request->has('status') && $request->status !== 'all') {
+            $query->where('status', $request->status);
+        }
+        
+        $students = $query->orderBy('created_at', 'desc')
+            ->paginate($request->get('per_page', 15));
+        
+        $formattedStudents = $students->map(function ($enrollment) {
+            return [
+                'id' => $enrollment->user->id,
+                'name' => $enrollment->user->name,
+                'email' => $enrollment->user->email,
+                'role' => $enrollment->user->role,
+                'enrollment_id' => $enrollment->id,
+                'enrolled_at' => $enrollment->created_at->toISOString(),
+                'status' => $enrollment->status,
+                'completed_at' => $enrollment->completed_at,
+            ];
+        });
+        
+        return response()->json([
+            'success' => true,
+            'students' => $formattedStudents,
+            'class' => [
+                'id' => $class->id,
+                'title' => $class->title,
+                'total_students' => $class->enrollments()->count(),
+            ],
+            'pagination' => [
+                'current_page' => $students->currentPage(),
+                'total_pages' => $students->lastPage(),
+                'total_items' => $students->total(),
+                'per_page' => $students->perPage(),
+            ],
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Get class students error: ' . $e->getMessage());
+        
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch class students',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+/**
+ * Enroll a student in a class.
+ */
+public function enrollStudent(Request $request, $id)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+    
+    $validator = Validator::make($request->all(), [
+        'student_id' => 'required|exists:users,id',
+        'status' => 'sometimes|in:active,completed,cancelled',
+    ]);
+    
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Validation failed',
+            'errors' => $validator->errors(),
+        ], 422);
+    }
+    
+    try {
+        $class = Tutorial::findOrFail($id);
+        $student = User::findOrFail($request->student_id);
+        
+        if ($student->role !== 'student') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Selected user is not a student',
+            ], 422);
+        }
+        
+        // Check if already enrolled
+        $existingEnrollment = $class->enrollments()
+            ->where('user_id', $student->id)
+            ->first();
+            
+        if ($existingEnrollment) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Student is already enrolled in this class',
+            ], 422);
+        }
+        
+        $enrollment = $class->enrollments()->create([
+            'user_id' => $student->id,
+            'status' => $request->status ?? 'active',
+        ]);
+        
+        // Update students count in tutorial
+        $class->increment('students');
+        
+        return response()->json([
+            'success' => true,
+            'message' => 'Student enrolled successfully',
+            'enrollment' => $enrollment->load('user'),
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Enroll student error: ' . $e->getMessage());
+        
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to enroll student',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+/**
+ * Remove a student from a class.
+ */
+public function removeStudent(Request $request, $id, $studentId)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+    
+    try {
+        $class = Tutorial::findOrFail($id);
+        
+        $enrollment = $class->enrollments()
+            ->where('user_id', $studentId)
+            ->firstOrFail();
+            
+        $enrollment->delete();
+        
+        // Update students count in tutorial
+        $class->decrement('students');
+        
+        return response()->json([
+            'success' => true,
+            'message' => 'Student removed from class successfully',
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Remove student error: ' . $e->getMessage());
+        
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to remove student',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+
+    /**
+     * Get tutors with pending degree verification.
+     */
+    public function getTutorsWithPendingDegree(Request $request)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $query = Tutor::with(['user', 'subjects'])
+                ->where('degree_verified', 'pending')
+                ->whereHas('user', function ($query) {
+                    $query->where(function ($q) {
+                        $q->where('status', 'active')->orWhere('status', 'pending');
+                    });
+                });
+
+            if ($request->has('search')) {
+                $search = $request->search;
+                $query->whereHas('user', function ($q) use ($search) {
+                    $q->where('name', 'like', "%{$search}%")
+                        ->orWhere('email', 'like', "%{$search}%");
+                });
+            }
+
+            $tutors = $query->orderBy('created_at', 'desc')
+                ->paginate($request->get('per_page', 10));
+
+            $formattedTutors = $tutors->map(function ($tutor) {
+                return [
+                    'id' => $tutor->id,
+                    'user_id' => $tutor->user_id,
+                    'name' => $tutor->user->name ?? 'N/A',
+                    'email' => $tutor->user->email ?? 'N/A',
+                    'phone' => $tutor->phone,
+                    'qualification' => $tutor->qualification,
+                    'degree_photo' => $tutor->degree_photo,
+                    'degree_photo_url' => $tutor->degree_photo ? url('storage/' . $tutor->degree_photo) : null,
+                    'degree_verified' => $tutor->degree_verified,
+                    'experience_years' => $tutor->experience_years,
+                    'age' => $tutor->age,
+                    'country' => $tutor->country,
+                    'city' => $tutor->city,
+                    'subjects' => $tutor->subjects->map(function ($subject) {
+                        return $subject->subject_name;
+                    })->toArray(),
+                    'subjects_details' => $tutor->subjects->map(function ($subject) {
+                        return [
+                            'name' => $subject->subject_name,
+                            'specialization' => $subject->specialization,
+                            'level' => $subject->level,
+                        ];
+                    }),
+                    'created_at' => $tutor->created_at->format('Y-m-d H:i:s'),
+                    'updated_at' => $tutor->updated_at->format('Y-m-d H:i:s'),
+                    'user_status' => $tutor->user->status ?? 'unknown',
+                    'bio' => $tutor->bio,
+                    'hourly_rate' => $tutor->hourly_rate,
+                    'address' => $tutor->address,
+                    'rejection_reason' => $tutor->rejection_reason,
+                ];
+            });
+
+            return response()->json([
+                'success' => true,
+                'tutors' => $formattedTutors,
+                'pagination' => [
+                    'current_page' => $tutors->currentPage(),
+                    'total_pages' => $tutors->lastPage(),
+                    'total_items' => $tutors->total(),
+                    'per_page' => $tutors->perPage(),
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to fetch tutors with pending degree: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch tutors with pending degree verification',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Approve tutor's degree.
+     */
+    public function approveDegree(Request $request, $tutorId)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        DB::beginTransaction();
+
+        try {
+            $tutor = Tutor::with('user')->findOrFail($tutorId);
+
+            $tutor->update([
+                'degree_verified' => 'approved',
+                'is_verified' => true,
+            ]);
+
+            if ($tutor->user && $tutor->user->status === 'pending') {
+                $tutor->user->update(['status' => 'active']);
+            }
+
+            Log::info('Degree approved by admin', [
+                'admin_id' => $request->user()->id,
+                'admin_name' => $request->user()->name,
+                'tutor_id' => $tutor->id,
+                'tutor_name' => $tutor->user->name ?? 'N/A',
+                'approved_at' => now(),
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Degree approved successfully',
+                'tutor' => [
+                    'id' => $tutor->id,
+                    'name' => $tutor->user->name ?? 'N/A',
+                    'degree_verified' => 'approved',
+                    'is_verified' => true,
+                    'user_status' => $tutor->user->status ?? 'unknown',
+                ],
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            Log::error('Failed to approve degree: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to approve degree',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Reject tutor's degree.
+     */
+    public function rejectDegree(Request $request, $tutorId)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'rejection_reason' => 'required|string|min:10|max:500',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        DB::beginTransaction();
+
+        try {
+            $tutor = Tutor::with('user')->findOrFail($tutorId);
+
+            $tutor->update([
+                'degree_verified' => 'rejected',
+                'rejection_reason' => $request->rejection_reason,
+            ]);
+
+            if ($tutor->user) {
+                $tutor->user->update([
+                    'status' => 'suspended',
+                    'suspended_at' => now(),
+                ]);
+            }
+
+            $this->sendDegreeRejectionEmail($tutor, $request->rejection_reason);
+
+            Log::info('Degree rejected by admin', [
+                'admin_id' => $request->user()->id,
+                'admin_name' => $request->user()->name,
+                'tutor_id' => $tutor->id,
+                'tutor_name' => $tutor->user->name ?? 'N/A',
+                'rejection_reason' => $request->rejection_reason,
+                'rejected_at' => now(),
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Degree rejected successfully. Tutor has been suspended.',
+                'tutor' => [
+                    'id' => $tutor->id,
+                    'name' => $tutor->user->name ?? 'N/A',
+                    'degree_verified' => 'rejected',
+                    'rejection_reason' => $request->rejection_reason,
+                    'user_status' => $tutor->user->status ?? 'unknown',
+                ],
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            Log::error('Failed to reject degree: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to reject degree',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Send degree rejection email.
+     */
+    private function sendDegreeRejectionEmail($tutor, $rejectionReason)
+    {
+        try {
+            if (!$tutor->user || !$tutor->user->email) {
+                Log::warning('Cannot send degree rejection email: Tutor or email not found', [
+                    'tutor_id' => $tutor->id,
+                ]);
+                return;
+            }
+
+            $emailData = [
+                'tutor' => $tutor,
+                'user' => $tutor->user,
+                'rejection_reason' => $rejectionReason,
+            ];
+
+            Mail::send('emails.degree_rejection', $emailData, function ($message) use ($tutor) {
+                $message->to($tutor->user->email)
+                    ->subject('❌ Degree Verification Rejected - Tutorial System');
+            });
+
+            Log::info('Degree rejection email sent', [
+                'tutor_id' => $tutor->id,
+                'tutor_email' => $tutor->user->email,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to send degree rejection email: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Get degree verification statistics.
+     */
+    public function getDegreeVerificationStats(Request $request)
+    {
+        if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+            return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+        }
+
+        try {
+            $stats = [
+                'total_pending' => Tutor::where('degree_verified', 'pending')->count(),
+                'total_approved' => Tutor::where('degree_verified', 'approved')->count(),
+                'total_rejected' => Tutor::where('degree_verified', 'rejected')->count(),
+                'total_tutors_with_degree' => Tutor::whereNotNull('degree_photo')->count(),
+            ];
+
+            $recentVerifications = Tutor::with('user')
+                ->whereNotNull('degree_verified')
+                ->where('degree_verified', '!=', 'pending')
+                ->where('updated_at', '>=', now()->subDays(7))
+                ->orderBy('updated_at', 'desc')
+                ->limit(10)
+                ->get()
+                ->map(function ($tutor) {
+                    return [
+                        'id' => $tutor->id,
+                        'name' => $tutor->user->name ?? 'N/A',
+                        'action' => ucfirst($tutor->degree_verified),
+                        'time' => $tutor->updated_at->diffForHumans(),
+                        'admin_action' => true,
+                    ];
+                });
+
+            return response()->json([
+                'success' => true,
+                'stats' => $stats,
+                'recent_verifications' => $recentVerifications,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to fetch degree verification stats: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to fetch degree verification statistics',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+/**
+ * Get all assignments (admin view)
+ */
+public function getAssignments(Request $request)
+{
+    $assignments = TutorialAssignment::with(['tutorial', 'tutor', 'assignedBy'])
+        ->orderBy('created_at', 'desc')
+        ->get();
+    
+    return response()->json([
+        'success' => true,
+        'assignments' => $assignments
+    ]);
+}
+
+/**
+ * Assign tutor to existing tutorial
+ */
+public function assignTutor(Request $request, $tutorialId)
+{
+    $validator = Validator::make($request->all(), [
+        'tutor_id' => 'required|exists:users,id',
+    ]);
+    
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'errors' => $validator->errors()
+        ], 422);
+    }
+    
+    $tutorial = Tutorial::findOrFail($tutorialId);
+    $tutor = User::findOrFail($request->tutor_id);
+    
+    if ($tutor->role !== 'tutor') {
+        return response()->json([
+            'success' => false,
+            'message' => 'Selected user is not a tutor'
+        ], 422);
+    }
+    
+    // Check if already assigned
+    $existing = TutorialAssignment::where('tutorial_id', $tutorialId)
+        ->where('tutor_id', $tutor->id)
+        ->first();
+    
+    if ($existing) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Tutor is already assigned to this tutorial'
+        ], 422);
+    }
+    
+    $assignment = TutorialAssignment::create([
+        'tutorial_id' => $tutorial->id,
+        'tutor_id' => $tutor->id,
+        'assigned_by_admin_id' => $request->user()->id,
+        'status' => 'pending'
+    ]);
+    
+    return response()->json([
+        'success' => true,
+        'message' => 'Tutor assigned successfully',
+        'assignment' => $assignment->load(['tutorial', 'tutor'])
+    ]);
+}
+
+/**
+ * Archive a tutorial
+ */
+public function archiveTutorial(Request $request, $tutorialId)
+{
+    $tutorial = Tutorial::findOrFail($tutorialId);
+    
+    $tutorial->update([
+        'status' => 'archived',
+        'is_published' => false
+    ]);
+    
+    return response()->json([
+        'success' => true,
+        'message' => 'Tutorial archived successfully',
+        'tutorial' => $tutorial
+    ]);
+}
+
+/**
+ * Get tutorials pending review (tutor completed content)
+ */
+public function getPendingReviewTutorials(Request $request)
+{
+    $tutorials = Tutorial::with(['tutor', 'category', 'assignments'])
+        ->where('status', 'pending_review')
+        ->orWhere('status', 'completed')
+        ->orderBy('updated_at', 'desc')
+        ->get();
+    
+    return response()->json([
+        'success' => true,
+        'tutorials' => $tutorials
+    ]);
+}
+
+/**
+ * Review and approve completed tutorial content
+ */
+public function reviewTutorial(Request $request, $tutorialId)
+{
+    $tutorial = Tutorial::with(['tutor', 'assignments'])->findOrFail($tutorialId);
+    
+    // Check if tutorial is ready for review
+    if (!in_array($tutorial->status, ['pending_review', 'completed'])) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Tutorial is not ready for review'
+        ], 422);
+    }
+    
+    $validator = Validator::make($request->all(), [
+        'action' => 'required|in:approve,request_changes,publish',
+        'feedback' => 'nullable|string|max:1000'
+    ]);
+    
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'errors' => $validator->errors()
+        ], 422);
+    }
+    
+    switch ($request->action) {
+        case 'approve':
+            $tutorial->update([
+                'status' => 'approved',
+                'approved_by_admin_id' => $request->user()->id,
+                'approved_at' => now()
+            ]);
+            $message = 'Tutorial content approved';
+            break;
+            
+        case 'request_changes':
+            $tutorial->update([
+                'status' => 'in_progress' // Send back to tutor
+            ]);
+            $message = 'Changes requested. Tutorial sent back to tutor.';
+            break;
+            
+        case 'publish':
+            $tutorial->update([
+                'status' => 'published',
+                'is_published' => true,
+                'approved_by_admin_id' => $request->user()->id,
+                'approved_at' => now()
+            ]);
+            $message = 'Tutorial published successfully';
+            break;
+    }
+    
+    return response()->json([
+        'success' => true,
+        'message' => $message,
+        'tutorial' => $tutorial
+    ]);
+}
+
+// Add these methods to your AdminController class
+
+/**
+ * Get email queue for development
+ */
+public function getEmailQueue(Request $request)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $query = \App\Models\EmailQueue::with('user');
+
+        // Filter by type
+        if ($request->has('type')) {
+            $query->where('type', $request->type);
+        }
+
+        // Filter by user
+        if ($request->has('user_id')) {
+            $query->where('user_id', $request->user_id);
+        }
+
+        // Filter by date range
+        if ($request->has('start_date') && $request->has('end_date')) {
+            $query->whereBetween('created_at', [
+                $request->start_date,
+                $request->end_date
+            ]);
+        }
+
+        // Search by email or subject
+        if ($request->has('search')) {
+            $search = $request->search;
+            $query->where(function ($q) use ($search) {
+                $q->where('to', 'like', "%{$search}%")
+                  ->orWhere('subject', 'like', "%{$search}%")
+                  ->orWhere('content', 'like', "%{$search}%");
+            });
+        }
+
+        $emails = $query->orderBy('created_at', 'desc')
+            ->paginate($request->get('per_page', 20));
+
+        $formattedEmails = $emails->map(function ($email) {
+            return [
+                'id' => $email->id,
+                'user_id' => $email->user_id,
+                'user_name' => $email->user->name ?? 'N/A',
+                'type' => $email->type,
+                'to' => $email->to,
+                'subject' => $email->subject,
+                'content_preview' => Str::limit($email->content, 100),
+                'content' => $email->content,
+                'token' => $email->token,
+                'verification_url' => $email->verification_url,
+                'sent_at' => $email->sent_at?->toISOString(),
+                'viewed_at' => $email->viewed_at?->toISOString(),
+                'created_at' => $email->created_at->toISOString(),
+                'is_viewed' => !is_null($email->viewed_at),
+                'is_verification' => $email->type === 'verification',
+            ];
+        });
+
+        $stats = [
+            'total' => \App\Models\EmailQueue::count(),
+            'verifications' => \App\Models\EmailQueue::where('type', 'verification')->count(),
+            'unviewed' => \App\Models\EmailQueue::whereNull('viewed_at')->count(),
+            'today' => \App\Models\EmailQueue::whereDate('created_at', today())->count(),
+        ];
+
+        return response()->json([
+            'success' => true,
+            'emails' => $formattedEmails,
+            'stats' => $stats,
+            'pagination' => [
+                'current_page' => $emails->currentPage(),
+                'total_pages' => $emails->lastPage(),
+                'total_items' => $emails->total(),
+                'per_page' => $emails->perPage(),
+            ],
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Get email queue error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch email queue',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+/**
+ * Get email queue details
+ */
+public function getEmailQueueDetails(Request $request, $id)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $email = \App\Models\EmailQueue::with('user')->findOrFail($id);
+
+        // Mark as viewed
+        if (!$email->viewed_at) {
+            $email->markAsViewed();
+        }
+
+        return response()->json([
+            'success' => true,
+            'email' => [
+                'id' => $email->id,
+                'user_id' => $email->user_id,
+                'user' => $email->user ? [
+                    'id' => $email->user->id,
+                    'name' => $email->user->name,
+                    'email' => $email->user->email,
+                    'role' => $email->user->role,
+                    'status' => $email->user->status,
+                ] : null,
+                'type' => $email->type,
+                'to' => $email->to,
+                'subject' => $email->subject,
+                'content' => $email->content,
+                'token' => $email->token,
+                'verification_url' => $email->verification_url,
+                'sent_at' => $email->sent_at?->toISOString(),
+                'viewed_at' => $email->viewed_at?->toISOString(),
+                'created_at' => $email->created_at->toISOString(),
+                'is_verification' => $email->type === 'verification',
+            ],
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Get email queue details error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch email details',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+/**
+ * Search email queue by token (for quick verification)
+ */
+public function searchEmailQueueByToken(Request $request, $token)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $email = \App\Models\EmailQueue::with('user')
+            ->where('token', $token)
+            ->first();
+
+        if (!$email) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Email not found with this token',
+            ], 404);
+        }
+
+        // Mark as viewed
+        if (!$email->viewed_at) {
+            $email->markAsViewed();
+        }
+
+        return response()->json([
+            'success' => true,
+            'email' => [
+                'id' => $email->id,
+                'type' => $email->type,
+                'to' => $email->to,
+                'subject' => $email->subject,
+                'content' => $email->content,
+                'token' => $email->token,
+                'verification_url' => $email->verification_url,
+                'user' => $email->user ? [
+                    'id' => $email->user->id,
+                    'name' => $email->user->name,
+                    'email' => $email->user->email,
+                    'role' => $email->user->role,
+                ] : null,
+            ],
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Search email queue by token error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to search email queue',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+/**
+ * Clear old emails from queue
+ */
+public function clearEmailQueue(Request $request)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $days = $request->get('days', 7);
+        $deleted = \App\Models\EmailQueue::where('created_at', '<', now()->subDays($days))->delete();
+
+        return response()->json([
+            'success' => true,
+            'message' => "Deleted {$deleted} old emails (older than {$days} days)",
+            'deleted_count' => $deleted,
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Clear email queue error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to clear email queue',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+/**
+ * Get email queue statistics
+ */
+public function getEmailQueueStats(Request $request)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    try {
+        $stats = [
+            'total_emails' => \App\Models\EmailQueue::count(),
+            'verification_emails' => \App\Models\EmailQueue::where('type', 'verification')->count(),
+            'welcome_emails' => \App\Models\EmailQueue::where('type', 'welcome')->count(),
+            'notification_emails' => \App\Models\EmailQueue::where('type', 'notification')->count(),
+            'unviewed_emails' => \App\Models\EmailQueue::whereNull('viewed_at')->count(),
+            'today_emails' => \App\Models\EmailQueue::whereDate('created_at', today())->count(),
+            'yesterday_emails' => \App\Models\EmailQueue::whereDate('created_at', today()->subDay())->count(),
+        ];
+
+        $recentEmails = \App\Models\EmailQueue::with('user')
+            ->orderBy('created_at', 'desc')
+            ->limit(10)
+            ->get()
+            ->map(function ($email) {
+                return [
+                    'id' => $email->id,
+                    'type' => $email->type,
+                    'to' => $email->to,
+                    'subject' => $email->subject,
+                    'user_name' => $email->user->name ?? 'N/A',
+                    'created_at' => $email->created_at->diffForHumans(),
+                ];
+            });
+
+        return response()->json([
+            'success' => true,
+            'stats' => $stats,
+            'recent_emails' => $recentEmails,
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Get email queue stats error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to fetch email queue statistics',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+/**
+ * Simulate sending email (for testing)
+ */
+public function simulateEmail(Request $request)
+{
+    if (!in_array($request->user()->role, ['admin', 'super_admin'])) {
+        return response()->json(['error' => 'Forbidden', 'message' => 'Admin access required'], 403);
+    }
+
+    if (!app()->environment('local', 'development', 'testing')) {
+        return response()->json([
+            'success' => false,
+            'message' => 'This endpoint is only available in development mode',
+        ], 403);
+    }
+
+    $validator = Validator::make($request->all(), [
+        'user_id' => 'required|exists:users,id',
+        'type' => 'required|in:verification,welcome,notification,approval,rejection',
+        'subject' => 'required|string|max:255',
+        'content' => 'required|string',
+        'token' => 'nullable|string',
+    ]);
+
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Validation failed',
+            'errors' => $validator->errors(),
+        ], 422);
+    }
+
+    try {
+        $user = User::findOrFail($request->user_id);
+
+        $email = \App\Models\EmailQueue::create([
+            'user_id' => $user->id,
+            'type' => $request->type,
+            'to' => $user->email,
+            'subject' => $request->subject,
+            'content' => $request->content,
+            'token' => $request->token,
+            'sent_at' => now(),
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Email simulated and stored in queue',
+            'email' => [
+                'id' => $email->id,
+                'type' => $email->type,
+                'to' => $email->to,
+                'subject' => $email->subject,
+                'content_preview' => Str::limit($email->content, 100),
+                'verification_url' => $email->verification_url,
+                'created_at' => $email->created_at->toISOString(),
+            ],
+        ]);
+    } catch (\Exception $e) {
+        Log::error('Simulate email error: ' . $e->getMessage());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to simulate email',
+            'error' => $e->getMessage(),
+        ], 500);
+    }
+}
+}
