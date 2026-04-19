@@ -111,7 +111,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
     require __DIR__ . '/api/messages/announcements.php';
     
     // Shared routes (tutorial sessions)
-    require __DIR__ . '/api/shared/sessions.php';
+  require __DIR__ . '/api/shared/sessions.php';
     
     // Admin routes
     require __DIR__ . '/api/admin/dashboard.php';
