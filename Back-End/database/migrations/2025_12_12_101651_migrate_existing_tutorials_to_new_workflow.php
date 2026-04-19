@@ -7,16 +7,12 @@ return new class extends Migration
 {
     public function up()
     {
-        // Update existing tutorials:
-        // 1. Set status based on is_published
-        // 2. Set created_by_role to 'tutor' (since they were created by tutors)
-        // 3. Create assignment records for existing tutor relationships
-        
+        // 1. Set status based on is_published (Postgres boolean fix)
         DB::statement("
             UPDATE tutorials 
             SET 
                 status = CASE 
-                    WHEN is_published = 1 THEN 'published' 
+                    WHEN is_published = true THEN 'published' 
                     ELSE 'draft' 
                 END,
                 created_by_role = 'tutor',
@@ -25,7 +21,7 @@ return new class extends Migration
             WHERE created_by_role IS NULL
         ");
         
-        // Create assignment records for existing tutor-tutorial relationships
+        // 2. Create assignment records for existing relationships
         DB::statement("
             INSERT INTO tutorial_assignments (
                 tutorial_id, 
@@ -42,10 +38,11 @@ return new class extends Migration
                 (SELECT id FROM users WHERE role = 'admin' LIMIT 1) as assigned_by_admin_id,
                 'accepted' as status,
                 t.created_at as accepted_at,
-                NOW() as created_at,
-                NOW() as updated_at
+                CURRENT_TIMESTAMP as created_at,
+                CURRENT_TIMESTAMP as updated_at
             FROM tutorials t
-            WHERE NOT EXISTS (
+            WHERE t.tutor_id IS NOT NULL 
+            AND NOT EXISTS (
                 SELECT 1 FROM tutorial_assignments ta 
                 WHERE ta.tutorial_id = t.id AND ta.tutor_id = t.tutor_id
             )
@@ -54,19 +51,15 @@ return new class extends Migration
 
     public function down()
     {
-        // Remove assignment records created by this migration
         DB::statement("DELETE FROM tutorial_assignments");
         
-        // Reset tutorial fields
         DB::statement("
             UPDATE tutorials 
             SET 
                 status = 'draft',
                 created_by_role = 'tutor',
-                admin_id = NULL,
                 approved_by_admin_id = NULL,
-                approved_at = NULL,
-                rejection_reason = NULL
+                approved_at = NULL
         ");
     }
 };

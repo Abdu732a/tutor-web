@@ -12,14 +12,21 @@ return new class extends Migration
      */
     public function up(): void
     {
-        DB::statement("ALTER TABLE tutorials MODIFY COLUMN status ENUM('draft','pending_approval','approved','pending_publication','published','archived','cancelled') NOT NULL DEFAULT 'draft'");
+        if (DB::getDriverName() === 'pgsql') {
+            DB::statement('ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_status_check');
+            DB::statement("ALTER TABLE tutorials ADD CONSTRAINT tutorials_status_check CHECK (status::text IN ('draft', 'pending_approval', 'approved', 'pending_publication', 'published', 'archived', 'cancelled'))");
+        } else {
+            DB::statement("ALTER TABLE tutorials MODIFY COLUMN status ENUM('draft','pending_approval','approved','pending_publication','published','archived','cancelled') NOT NULL DEFAULT 'draft'");
+        }
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
-        DB::statement("ALTER TABLE tutorials MODIFY COLUMN status ENUM('draft','pending_approval','approved','published','archived','cancelled') NOT NULL DEFAULT 'draft'");
+        if (DB::getDriverName() === 'pgsql') {
+            DB::statement('ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_status_check');
+            DB::statement("ALTER TABLE tutorials ADD CONSTRAINT tutorials_status_check CHECK (status::text IN ('draft', 'pending_approval', 'approved', 'published', 'archived', 'cancelled'))");
+        } else {
+            DB::statement("ALTER TABLE tutorials MODIFY COLUMN status ENUM('draft','pending_approval','approved','published','archived','cancelled') NOT NULL DEFAULT 'draft'");
+        }
     }
 };

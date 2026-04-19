@@ -3,17 +3,23 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
-use Illuminate\Support\Facades\DB;
 
 return new class extends Migration
 {
     public function up()
     {
-        DB::statement("ALTER TABLE users MODIFY COLUMN role ENUM('student', 'tutor', 'admin', 'super_admin') NOT NULL");
+        Schema::table('users', function (Blueprint $table) {
+            // This changes the 'role' column to a string and sets the default
+            // The change() method ensures we are updating the existing column
+            $table->string('role')->default('student')->change();
+        });
     }
 
     public function down()
     {
-        DB::statement("ALTER TABLE users MODIFY COLUMN role ENUM('student', 'tutor', 'admin') NOT NULL");
+        Schema::table('users', function (Blueprint $table) {
+            // Revert if necessary
+            $table->string('role')->default('student')->change();
+        });
     }
 };
