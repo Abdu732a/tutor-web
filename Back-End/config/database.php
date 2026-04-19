@@ -84,15 +84,15 @@ return [
         ],
 'pgsql' => [
     'driver' => 'pgsql',
-    'host' => trim(env('DB_HOST')),
-    'port' => trim(env('DB_PORT')),
-    'database' => trim(env('DB_DATABASE')), // This removes any hidden quotes
-    'username' => trim(env('DB_USERNAME')),
+    'host' => env('DB_HOST'),
+    'port' => env('DB_PORT', 5432),
+    'database' => env('DB_DATABASE', 'postgres'),
+    'username' => env('DB_USERNAME', 'postgres'),
     'password' => env('DB_PASSWORD'),
     'charset' => 'utf8',
     'prefix' => '',
     'search_path' => 'public',
-    'sslmode' => 'require',
+    'sslmode' => env('DB_SSLMODE', 'require'),
 ],
         'sqlsrv' => [
             'driver' => 'sqlsrv',
